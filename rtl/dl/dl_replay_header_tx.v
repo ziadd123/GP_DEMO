@@ -1,99 +1,99 @@
-module dl_replay_header_tx #( // dl_replay_header_tx模块：LLR发送头调度与可选提前元数据保护
-    parameter integer C_EARLY_TX_METADATA = 0 // 非零时采用由集成层明确证明的提前发送源元数据资格
-) ( // dl_replay_header_tx模块：LLR发送头调度，单时钟沿前输出和沿上提交
-    input wire i_clk, // 本地唯一时钟
-    input wire i_rstn, // 低有效同步复位
-    input wire i_link_reset, // 同步链路状态清除
-    input wire i_flit_send, // 本沿实际提交所选Flit
-    input wire i_payload, // 所选源含payload
-    input wire i_replay, // 所选源来自重放队列，含最后一项
-    input wire i_first_replay, // 所选源是本次首项重放
-    input wire [8:0] i_tx_sequence, // 所选源完整非零序号
-    input wire i_tx_metadata_ok, // 仅提前模式使用，默认模式仍执行完整原始元数据保护
-    input wire [8:0] i_rx_sequence, // 含本拍接纳结果的接收非零序号
-    input wire i_rx_request, // 本拍接收事件重装三个请求副本
-    input wire i_new_group, // 本拍进入新的实际FEC组
-    output wire [23:0] o_header, // 有效时输出完整头，保留位为零
-    output wire o_header_valid, // 本拍生成并提交有效头
-    output wire o_metadata_error, // send拍内部元数据不合法
-    output wire [2:0] o_explicit_count, // 当前显式发送间隔状态
-    output wire [1:0] o_request_count, // 当前剩余请求副本状态
-    output wire [8:0] o_request_sequence, // 首份实际发送时捕获的目标
-    output wire o_group_used // 当前组已实际发送过请求
-); // 端口结束
-reg [2:0] reg_explicit_count; // 显式间隔计数
-reg [1:0] reg_request_count; // 请求副本计数
-reg [8:0] reg_request_sequence; // 请求目标快照
-reg reg_group_used; // 当前组请求占用
-wire flag_active; // 复位和清除外的工作资格
-wire flag_bad_metadata; // 内部元数据保护
-wire flag_send; // 合法实际发送
-wire flag_explicit; // 当前头使用完整序号
-wire flag_request; // 当前头使用请求编码
-wire [1:0] dec_pending; // 同拍接收事件之后的副本数
-wire [8:0] dec_successor; // 有效接收序号的环后继
-wire [8:0] dec_target; // 本拍请求目标
-wire [23:0] dec_explicit_header; // 完整序号头
-wire [23:0] dec_command_header; // 压缩序号与命令头
-assign flag_active = i_rstn && !i_link_reset; // 同步复位期间沿前静默
-assign flag_bad_metadata = (i_rx_sequence == 9'd0) || ((C_EARLY_TX_METADATA != 0) ? !i_tx_metadata_ok : ((i_tx_sequence == 9'd0) || (i_replay && !i_payload) || (i_first_replay && !i_replay))); // 非零序号及源类别一致性
-assign flag_send = flag_active && i_flit_send && !flag_bad_metadata; // 只提交合法元数据
-assign dec_pending = i_rx_request ? 2'd3 : reg_request_count; // 先处理同拍接收请求
-assign flag_explicit = i_first_replay || (reg_explicit_count <= 3'd1); // 先减一后判零，首重放优先
-assign flag_request = !flag_explicit && (dec_pending != 2'd0) && (!reg_group_used || i_new_group); // 同一实际组最多一份请求
-assign dec_successor = (i_rx_sequence == 9'd511) ? 9'd1 : i_rx_sequence + 9'd1; // 合法序号环跳过零
-assign dec_target = (dec_pending == 2'd3) ? dec_successor : reg_request_sequence; // 首次实际发送捕获，其余保持
-assign dec_explicit_header = {2'b00, i_replay, i_payload, 3'b000, i_tx_sequence, 8'b00000000}; // op为Original或Replay
-assign dec_command_header = {2'b01, flag_request, i_payload, (flag_request ? dec_target : i_rx_sequence), i_tx_sequence[2:0], 8'b00000000}; // Ack或Replay Request字段
-assign o_header = flag_send ? (flag_explicit ? dec_explicit_header : dec_command_header) : 24'd0; // 非提交拍清零输出
-assign o_header_valid = flag_send; // 有效即本拍提交
-assign o_metadata_error = flag_active && i_flit_send && flag_bad_metadata; // 空闲元数据不触发诊断
-assign o_explicit_count = reg_explicit_count; // 完整当前状态观察
-assign o_request_count = reg_request_count; // 完整当前状态观察
-assign o_request_sequence = reg_request_sequence; // 完整当前状态观察
-assign o_group_used = reg_group_used; // 完整当前状态观察
-always @(posedge i_clk) begin // 显式间隔只按合法实际发送推进
-    if (!i_rstn) begin // 全局同步复位
-        reg_explicit_count <= 3'd7; // 初始七个Flit间隔
-    end else if (i_link_reset) begin // 链路重新初始化
-        reg_explicit_count <= 3'd7; // 重装间隔
-    end else if (flag_send) begin // 实际合法提交
-        if (flag_explicit) begin // 显式发送重装
-            reg_explicit_count <= 3'd7; // 保持七Flit间隔
-        end else begin // 非显式发送推进
-            reg_explicit_count <= reg_explicit_count - 3'd1; // 已排除零和一，不会下溢
-        end // 结束显式分支
-    end // 其他周期保持
-end // 显式计数寄存器结束
-always @(posedge i_clk) begin // 接收请求和本拍发送副本顺序处理
-    if (!i_rstn) begin // 全局同步复位
-        reg_request_count <= 2'd0; // 初始无请求
-    end else if (i_link_reset) begin // 链路重新初始化
-        reg_request_count <= 2'd0; // 清空请求
-    end else if (flag_send && flag_request) begin // 本拍实际发出一份请求
-        reg_request_count <= dec_pending - 2'd1; // 消耗接收重装之后的副本数
-    end else if (i_rx_request) begin // 接收请求尚未实际发送
-        reg_request_count <= 2'd3; // 指派三个副本而非累加
-    end // 其他周期保持
-end // 请求副本寄存器结束
-always @(posedge i_clk) begin // 首份发送时冻结请求目标
-    if (!i_rstn) begin // 全局同步复位
-        reg_request_sequence <= 9'd0; // 没有已捕获请求
-    end else if (i_link_reset) begin // 链路重新初始化
-        reg_request_sequence <= 9'd0; // 清除旧目标
-    end else if (flag_send && flag_request && (dec_pending == 2'd3)) begin // 首份实际发送
-        reg_request_sequence <= dec_successor; // 捕获当拍有效接收序号后继
-    end // 其他周期保持目标
-end // 请求目标寄存器结束
-always @(posedge i_clk) begin // 实际FEC组请求占用
-    if (!i_rstn) begin // 全局同步复位
-        reg_group_used <= 1'b0; // 初始组可发送请求
-    end else if (i_link_reset) begin // 链路重新初始化
-        reg_group_used <= 1'b0; // 清除组占用
-    end else if (flag_send && flag_request) begin // 新组同拍发送也必须记占用
-        reg_group_used <= 1'b1; // 本组已有实际请求
-    end else if (i_new_group) begin // 无请求发送时进入新组
-        reg_group_used <= 1'b0; // 即使空闲也释放旧组占用
-    end // 其他周期保持
-end // 组占用寄存器结束
-endmodule // 结束dl_replay_header_tx模块
+module dl_replay_header_tx #( // dl_replay_header_tx module: LLR send-header scheduling with optional early metadata protection.
+    parameter integer C_EARLY_TX_METADATA = 0 // When nonzero, early send-source metadata qualification is explicitly proven by the integration layer.
+) ( // dl_replay_header_tx module: LLR send-header scheduling, one-cycle pre-output and edge-based commit.
+    input wire i_clk, // Local unique clock.
+    input wire i_rstn, // Active-low synchronous reset.
+    input wire i_link_reset, // Synchronous link state clear.
+    input wire i_flit_send, // Real commit of the selected Flit in the current cycle.
+    input wire i_payload, // Selected source contains payload.
+    input wire i_replay, // Selected source comes from replay queue and contains the last item.
+    input wire i_first_replay, // Selected source is the first replay in this cycle.
+    input wire [8:0] i_tx_sequence, // Full non-zero sequence number of the selected source.
+    input wire i_tx_metadata_ok, // Only used in early mode; default mode still enforces full original metadata protection.
+    input wire [8:0] i_rx_sequence, // Receive non-zero sequence number including this-cycle admission result.
+    input wire i_rx_request, // Current receive event reloads three request copies.
+    input wire i_new_group, // Current cycle enters a new actual FEC group.
+    output wire [23:0] o_header, // Full header output when valid, reserved bits set to zero.
+    output wire o_header_valid, // Current cycle generated and committed valid header.
+    output wire o_metadata_error, // Metadata invalid in the send cycle.
+    output wire [2:0] o_explicit_count, // Current explicit send interval state.
+    output wire [1:0] o_request_count, // Current remaining request-copy state.
+    output wire [8:0] o_request_sequence, // Target captured when the first send actually occurs.
+    output wire o_group_used // Current group has already sent a request.
+); // End of port declaration.
+reg [2:0] reg_explicit_count; // Explicit interval count.
+reg [1:0] reg_request_count; // Request copy count.
+reg [8:0] reg_request_sequence; // Request target snapshot.
+reg reg_group_used; // Current group request occupancy.
+wire flag_active; // Working qualification outside reset and clear.
+wire flag_bad_metadata; // Internal metadata protection.
+wire flag_send; // Legal actual send.
+wire flag_explicit; // Current header uses full sequence number.
+wire flag_request; // Current header uses request encoding.
+wire [1:0] dec_pending; // Copy count after current-cycle receive event.
+wire [8:0] dec_successor; // Ring successor of the valid receive sequence.
+wire [8:0] dec_target; // Request target for this cycle.
+wire [23:0] dec_explicit_header; // Full sequence header.
+wire [23:0] dec_command_header; // Compressed sequence with command header.
+assign flag_active = i_rstn && !i_link_reset; // All commit pulses are silent during reset.
+assign flag_bad_metadata = (i_rx_sequence == 9'd0) || ((C_EARLY_TX_METADATA != 0) ? !i_tx_metadata_ok : ((i_tx_sequence == 9'd0) || (i_replay && !i_payload) || (i_first_replay && !i_replay))); // Metadata is checked together with payload and replay state.
+assign flag_send = flag_active && i_flit_send && !flag_bad_metadata; // Only legal metadata is committed.
+assign dec_pending = i_rx_request ? 2'd3 : reg_request_count; // Process current receive request before other actions.
+assign flag_explicit = i_first_replay || (reg_explicit_count <= 3'd1); // Decrement first, then test zero; first replay has priority.
+assign flag_request = !flag_explicit && (dec_pending != 2'd0) && (!reg_group_used || i_new_group); // No more than one request per actual group.
+assign dec_successor = (i_rx_sequence == 9'd511) ? 9'd1 : i_rx_sequence + 9'd1; // Valid sequence wraps around zero.
+assign dec_target = (dec_pending == 2'd3) ? dec_successor : reg_request_sequence; // Capture target on first actual send; subsequent sends keep the same target.
+assign dec_explicit_header = {2'b00, i_replay, i_payload, 3'b000, i_tx_sequence, 8'b00000000}; // op is Original or Replay.
+assign dec_command_header = {2'b01, flag_request, i_payload, (flag_request ? dec_target : i_rx_sequence), i_tx_sequence[2:0], 8'b00000000}; // Ack or Replay Request fields.
+assign o_header = flag_send ? (flag_explicit ? dec_explicit_header : dec_command_header) : 24'd0; // Empty output when no commit.
+assign o_header_valid = flag_send; // Valid means the header was generated in this cycle.
+assign o_metadata_error = flag_active && i_flit_send && flag_bad_metadata; // No diagnosis when idle metadata is not present.
+assign o_explicit_count = reg_explicit_count; // Current state observation.
+assign o_request_count = reg_request_count; // Current state observation.
+assign o_request_sequence = reg_request_sequence; // Current state observation.
+assign o_group_used = reg_group_used; // Current state observation.
+always @(posedge i_clk) begin // Explicit interval advances only on valid sends.
+    if (!i_rstn) begin // Global synchronous reset.
+        reg_explicit_count <= 3'd7; // Initial interval is seven flits.
+    end else if (i_link_reset) begin // Link reinitialization.
+        reg_explicit_count <= 3'd7; // Reinitialize interval.
+    end else if (flag_send) begin // Valid commit.
+        if (flag_explicit) begin // Explicit send reload.
+            reg_explicit_count <= 3'd7; // Keep seven-flit interval.
+        end else begin // Non-explicit send advances.
+            reg_explicit_count <= reg_explicit_count - 3'd1; // Zero/one are excluded, so it will not underflow.
+        end // End of explicit branch.
+    end // Other cycles hold state.
+end // End of explicit count register.
+always @(posedge i_clk) begin // Receive requests and current send copies are handled in sequence.
+    if (!i_rstn) begin // Global synchronous reset.
+        reg_request_count <= 2'd0; // Initially no requests.
+    end else if (i_link_reset) begin // Link reset.
+        reg_request_count <= 2'd0; // Clear queued requests.
+    end else if (flag_send && flag_request) begin // A request is sent in this cycle.
+        reg_request_count <= dec_pending - 2'd1; // Consume the copy count after a receive reload.
+    end else if (i_rx_request) begin // Receive request not yet sent.
+        reg_request_count <= 2'd3; // Assign three copies instead of accumulating.
+    end // Other cycles hold state.
+end // End of request copy register.
+always @(posedge i_clk) begin // Freeze the request target when the first send occurs.
+    if (!i_rstn) begin // Global synchronous reset.
+        reg_request_sequence <= 9'd0; // No captured request.
+    end else if (i_link_reset) begin // Link reset.
+        reg_request_sequence <= 9'd0; // Clear old target.
+    end else if (flag_send && flag_request && (dec_pending == 2'd3)) begin // First send in this cycle.
+        reg_request_sequence <= dec_successor; // Capture the valid receive sequence successor.
+    end // Other cycles hold target.
+end // End of request target register.
+always @(posedge i_clk) begin // Actual request occupancy of the FEC group.
+    if (!i_rstn) begin // Global synchronous reset.
+        reg_group_used <= 1'b0; // Initially the group may send a request.
+    end else if (i_link_reset) begin // Link reset.
+        reg_group_used <= 1'b0; // Clear group usage.
+    end else if (flag_send && flag_request) begin // A request must also be recorded when sent in a new group.
+        reg_group_used <= 1'b1; // This group already sent a request.
+    end else if (i_new_group) begin // Entering a new group without a request being sent.
+        reg_group_used <= 1'b0; // Release old group occupancy even when idle.
+    end // Other cycles hold state.
+end // End of group occupancy register.
+endmodule // End of dl_replay_header_tx module.
